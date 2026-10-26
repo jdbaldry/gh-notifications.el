@@ -49,7 +49,6 @@
   :type 'string
   :group 'gh-notifications)
 
-
 (defcustom gh-notifications-fetch-all nil
   "When non-nil, fetch all notifications including already-read ones.
 When nil (the default), fetch only unread notifications."
@@ -929,7 +928,7 @@ Call CALLBACK with no arguments when processing completes."
                     (message "gh-notifications: failed to load PR data for %s (HTTP %s)"
                              id status)
                     (when callback (funcall callback))))))
-    (when callback (funcall callback)))
+  (when callback (funcall callback)))
 
 ;;; Subject URL resolution
 
