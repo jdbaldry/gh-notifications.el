@@ -1,5 +1,7 @@
 # gh-notifications.el
 
+**Note:** this project was primarily AI-generated.
+
 An Emacs GitHub notification manager built on `magit-section` and `transient`.
 Notifications are grouped by repository in a collapsible section buffer.
 All actions dispatch through a transient menu or direct key bindings.
