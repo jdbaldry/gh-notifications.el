@@ -63,6 +63,7 @@ Use `H` to open a compact shortcut and workflow guide.
 | `/ r` | Filter by repository                       |
 | `/ T` | Filter by subject type                     |
 | `/ a` | Human-only mode (hide automation and CI)   |
+| `/ R` | Hide Renovate pull requests                |
 | `/ c` | Clear all filters                          |
 | `S f` | Sweep step 1: filter by rule               |
 | `S s` | Sweep step 2: mark inactive PRs done       |

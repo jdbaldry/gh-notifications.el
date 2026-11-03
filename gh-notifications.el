@@ -102,10 +102,19 @@ Pruning is skipped when pagination truncates at `gh-notifications-max-pages'."
   :group 'gh-notifications)
 
 (defcustom gh-notifications-pinned-users
-  '("robbymilo" "francescozannini" "marc-nogue")
+  '("robbymilo" "nate-walters-grafana" "marc-nogue")
   "GitHub login names shown as quick-filter shortcuts in the dispatch menu.
 Each user can be toggled on and off with a single key from the Users section
 of `gh-notifications-dispatch'."
+  :type '(repeat string)
+  :group 'gh-notifications)
+
+(defcustom gh-notifications-renovate-logins
+  '("renovate[bot]" "renovate-sh-app[bot]" "renovate-bot")
+  "GitHub login names treated as Renovate when hiding Renovate pull requests.
+The hosted Renovate app authors pull requests as \"renovate[bot]\".
+The Mend self-hosted GitHub app authors as \"renovate-sh-app[bot]\".
+Other self-hosted deployments commonly use \"renovate-bot\"."
   :type '(repeat string)
   :group 'gh-notifications)
 
@@ -290,6 +299,12 @@ Known values: success failure neutral cancelled skipped timed_out action_require
 
 (defvar gh-notifications--filter-hide-automation-and-ci nil
   "When non-nil, hide CheckSuite and rule-matched automation notifications.")
+
+(defvar gh-notifications--filter-hide-renovate nil
+  "When non-nil, hide PullRequest notifications authored by Renovate.
+Authorship is matched against `gh-notifications-renovate-logins' using the
+augmented author login.  Notifications whose author is not yet augmented are
+shown until augmentation resolves.")
 
 (defvar gh-notifications--filter-users nil
   "List of GitHub login strings.
@@ -1009,6 +1024,7 @@ parsed from the notification title.  Falls back further to the repo URL."
                    gh-notifications--filter-repos))
        (gh-notifications--passes-ci-filter-p n)
        (gh-notifications--passes-automation-and-ci-filter-p n)
+       (gh-notifications--passes-renovate-filter-p n)
        (gh-notifications--passes-user-filter-p n)))
 
 (defun gh-notifications--passes-ci-filter-p (n)
@@ -1040,6 +1056,23 @@ Only PullRequest notifications are considered automation notifications."
       (and (not (string= (gh-notifications-notification-subject-type n)
                          "CheckSuite"))
            (not (gh-notifications--automation-notification-p n)))))
+
+(defun gh-notifications--renovate-notification-p (n)
+  "Return non-nil when N is a PullRequest authored by Renovate.
+Authorship comes from the augmented author login.  Returns nil when the
+author has not been augmented yet."
+  (and (string= (gh-notifications-notification-subject-type n) "PullRequest")
+       (let* ((aug    (gethash (gh-notifications-notification-id n)
+                               gh-notifications--augmentations))
+              (author (plist-get aug :author)))
+         (and author
+              (member author gh-notifications-renovate-logins)
+              t))))
+
+(defun gh-notifications--passes-renovate-filter-p (n)
+  "Return non-nil when N passes the hide-Renovate filter."
+  (or (not gh-notifications--filter-hide-renovate)
+      (not (gh-notifications--renovate-notification-p n))))
 
 (defun gh-notifications--passes-user-filter-p (n)
   "Return non-nil when N passes the active user filter.
@@ -1261,6 +1294,7 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
                           gh-notifications--filter-repos
                           gh-notifications--filter-hide-ci
                           gh-notifications--filter-hide-automation-and-ci
+                          gh-notifications--filter-hide-renovate
                           gh-notifications--filter-ci-conclusions
                           gh-notifications--filter-users)))
     (insert (propertize (pcase gh-notifications--view
@@ -1302,6 +1336,8 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
         (insert (propertize "  ci hidden" 'font-lock-face 'gh-notifications-type-ci)))
       (when gh-notifications--filter-hide-automation-and-ci
         (insert (propertize "  human-only" 'font-lock-face 'magit-section-heading)))
+      (when gh-notifications--filter-hide-renovate
+        (insert (propertize "  renovate hidden" 'font-lock-face 'magit-section-heading)))
       (when gh-notifications--filter-ci-conclusions
         (insert (propertize "  ci " 'font-lock-face 'magit-dimmed))
         (insert (propertize (string-join gh-notifications--filter-ci-conclusions ",")
@@ -1894,7 +1930,17 @@ Selecting nothing clears the type filter."
         gh-notifications--filter-ci-conclusions            nil
         gh-notifications--filter-hide-ci                   nil
         gh-notifications--filter-hide-automation-and-ci    nil
+        gh-notifications--filter-hide-renovate             nil
         gh-notifications--filter-users                     nil)
+  (gh-notifications--render))
+
+(defun gh-notifications-toggle-filter-hide-renovate ()
+  "Toggle visibility of Renovate pull request notifications.
+When enabled, hides PullRequest notifications whose augmented author login
+appears in `gh-notifications-renovate-logins'."
+  (interactive)
+  (setq gh-notifications--filter-hide-renovate
+        (not gh-notifications--filter-hide-renovate))
   (gh-notifications--render))
 
 (defun gh-notifications-toggle-filter-hide-automation-and-ci ()
@@ -2530,10 +2576,10 @@ Background poll errors are logged silently to avoid interrupting the user."
   (interactive)
   (gh-notifications--toggle-user-filter "robbymilo"))
 
-(defun gh-notifications-filter-user-francescozannini ()
-  "Toggle francescozannini in the user filter."
+(defun gh-notifications-filter-user-nate-walters-grafana ()
+  "Toggle nate-walters-grafana in the user filter."
   (interactive)
-  (gh-notifications--toggle-user-filter "francescozannini"))
+  (gh-notifications--toggle-user-filter "nate-walters-grafana"))
 
 (defun gh-notifications-filter-user-marc-nogue ()
   "Toggle marc-nogue in the user filter."
@@ -2592,6 +2638,7 @@ Background poll errors are logged silently to avoid interrupting the user."
     ("/ r" "By repo"           gh-notifications-set-filter-repos)
     ("/ T" "By type"           gh-notifications-set-filter-types)
     ("/ a" "Human-only mode"   gh-notifications-toggle-filter-hide-automation-and-ci)
+    ("/ R" "Hide Renovate PRs" gh-notifications-toggle-filter-hide-renovate)
     ("/ c" "Clear all"         gh-notifications-clear-filters)]
    [("C h" "CI: toggle hide"             gh-notifications-toggle-hide-ci)
     ("C f" "CI: failures only"          gh-notifications-filter-ci-failures)
@@ -2599,7 +2646,7 @@ Background poll errors are logged silently to avoid interrupting the user."
     ("C /" "CI: by conclusion"          gh-notifications-set-filter-ci-conclusions)
     ("C c" "CI: clear"                  gh-notifications-clear-filter-ci)]
    [("@ 1" "@robbymilo"             gh-notifications-filter-user-robbymilo)
-    ("@ 2" "@francescozannini"      gh-notifications-filter-user-francescozannini)
+    ("@ 2" "@nate-walters-grafana"  gh-notifications-filter-user-nate-walters-grafana)
     ("@ 3" "@marc-nogue"            gh-notifications-filter-user-marc-nogue)
     ("@ /" "Users: by login"        gh-notifications-set-filter-users)
     ("@ c" "Users: clear"           gh-notifications-clear-filter-users)]
@@ -2660,6 +2707,7 @@ Background poll errors are logged silently to avoid interrupting the user."
 (define-key gh-notifications-mode-map (kbd "/ r") #'gh-notifications-set-filter-repos)
 (define-key gh-notifications-mode-map (kbd "/ T") #'gh-notifications-set-filter-types)
 (define-key gh-notifications-mode-map (kbd "/ a") #'gh-notifications-toggle-filter-hide-automation-and-ci)
+(define-key gh-notifications-mode-map (kbd "/ R") #'gh-notifications-toggle-filter-hide-renovate)
 (define-key gh-notifications-mode-map (kbd "/ c") #'gh-notifications-clear-filters)
 (define-key gh-notifications-mode-map (kbd "C h") #'gh-notifications-toggle-hide-ci)
 (define-key gh-notifications-mode-map (kbd "C f") #'gh-notifications-filter-ci-failures)
@@ -2667,7 +2715,7 @@ Background poll errors are logged silently to avoid interrupting the user."
 (define-key gh-notifications-mode-map (kbd "C /") #'gh-notifications-set-filter-ci-conclusions)
 (define-key gh-notifications-mode-map (kbd "C c") #'gh-notifications-clear-filter-ci)
 (define-key gh-notifications-mode-map (kbd "@ 1") #'gh-notifications-filter-user-robbymilo)
-(define-key gh-notifications-mode-map (kbd "@ 2") #'gh-notifications-filter-user-francescozannini)
+(define-key gh-notifications-mode-map (kbd "@ 2") #'gh-notifications-filter-user-nate-walters-grafana)
 (define-key gh-notifications-mode-map (kbd "@ 3") #'gh-notifications-filter-user-marc-nogue)
 (define-key gh-notifications-mode-map (kbd "@ /") #'gh-notifications-set-filter-users)
 (define-key gh-notifications-mode-map (kbd "@ c") #'gh-notifications-clear-filter-users)
