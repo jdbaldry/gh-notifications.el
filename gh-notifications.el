@@ -27,7 +27,8 @@
 
 ;; gh-notifications.el is a GitHub notification manager for Emacs.
 ;; It provides a magit-section based list buffer with transient dispatch,
-;; batch operations, filtering, and background polling.
+;; batch operations, filtering, and a deferred-sync outbox: actions are
+;; queued locally and sent to GitHub on refresh.
 
 ;;; Code:
 
@@ -75,13 +76,6 @@ Each page contains up to 100 pull requests."
   :type 'natnum
   :group 'gh-notifications)
 
-(defcustom gh-notifications-poll-interval 60
-  "Number of seconds between background notification polls.
-Set to nil to disable automatic polling."
-  :type '(choice (const :tag "Disabled" nil)
-                 (natnum :tag "Seconds"))
-  :group 'gh-notifications)
-
 (defcustom gh-notifications-auto-mark-done-days nil
   "Automatically mark notifications done after this many days.
 Set to nil to disable automatic cleanup."
@@ -111,10 +105,11 @@ of `gh-notifications-dispatch'."
 
 (defcustom gh-notifications-renovate-logins
   '("renovate[bot]" "renovate-sh-app[bot]" "renovate-bot")
-  "GitHub login names treated as Renovate when hiding Renovate pull requests.
-The hosted Renovate app authors pull requests as \"renovate[bot]\".
-The Mend self-hosted GitHub app authors as \"renovate-sh-app[bot]\".
-Other self-hosted deployments commonly use \"renovate-bot\"."
+  "GitHub login names treated as Renovate in human-only mode.
+A PullRequest whose augmented author login is in this list is hidden along
+with other automation when human-only mode is active.  Matching needs the
+author augmentation, so a Renovate PR stays visible until augmentation
+resolves."
   :type '(repeat string)
   :group 'gh-notifications)
 
@@ -149,6 +144,14 @@ done once they are merged or closed."
   (locate-user-emacs-file "gh-notifications/saved.el")
   "File where saved-for-later notifications are persisted.
 Read on first access and rewritten after every save or unsave."
+  :type 'file
+  :group 'gh-notifications)
+
+(defcustom gh-notifications-db-file
+  (locate-user-emacs-file "gh-notifications/pending.sqlite3")
+  "SQLite database file where pending to-be-sent actions are persisted.
+Actions queued in the inbox are held here until a refresh flushes them to
+GitHub, so they survive an Emacs restart."
   :type 'file
   :group 'gh-notifications)
 
@@ -272,11 +275,18 @@ Persisted to `gh-notifications-saved-file'.")
 (defvar gh-notifications--kept-ids nil
   "List of thread IDs pinned to survive reconciliation pruning.")
 
-(defvar gh-notifications--poll-timer nil
-  "Timer object for background polling.")
+(defvar gh-notifications--pending (make-hash-table :test #'equal)
+  "Hash table mapping thread-id to a pending-action plist.
+Each plist has keys :action (one of the symbols `done', `read',
+`unsubscribe', `close-pr'), :notification (the struct) and :queued-at (a
+float time).  Entries are held until `gh-notifications-refresh' flushes them
+to GitHub.  Persisted to `gh-notifications-db-file'.")
 
-(defvar gh-notifications--poll-paused nil
-  "When non-nil, automatic polling is paused.")
+(defvar gh-notifications--pending-loaded nil
+  "Non-nil once `gh-notifications--pending' has been loaded from the database.")
+
+(defvar gh-notifications--db nil
+  "Open SQLite connection for the pending-action store, or nil.")
 
 (defvar gh-notifications--filter-text ""
   "Current text filter substring.")
@@ -603,8 +613,7 @@ a request, so a `let' binding here is sufficient even for async calls."
 When CALLBACK is non-nil, call it with no arguments after the fetch
 completes.
 When SILENT is non-nil, fetch errors are logged to `*Messages*' without
-echo-area display.  Used by the background poll to avoid interrupting
-interaction.
+echo-area display.
 If multiple fetches overlap, only the newest fetch may update local state."
   (let ((results nil)
         (full-fetch t)
@@ -824,8 +833,7 @@ Notifications in `gh-notifications--kept-ids' are retained."
              (updated (gh-notifications-notification-updated-at n))
              (ts      (when updated (float-time (date-to-time updated)))))
         (when (and ts (< ts cutoff))
-          (gh-notifications--api-mark-done
-           (gh-notifications-notification-id n) nil))))))
+          (gh-notifications--pending-put n 'done))))))
 
 ;;; Per-notification API actions
 
@@ -1011,21 +1019,26 @@ parsed from the notification title.  Falls back further to the repo URL."
               (gh-notifications--current-alist)))
 
 (defun gh-notifications--passes-filters-p (n)
-  "Return non-nil when notification N satisfies every active filter."
-  (and (or (not gh-notifications--filter-unread-only)
-           (gh-notifications-notification-unread n))
-       (or (string-empty-p gh-notifications--filter-text)
-           (gh-notifications--text-match-p n gh-notifications--filter-text))
-       (or (null gh-notifications--filter-types)
-           (member (gh-notifications-notification-subject-type n)
-                   gh-notifications--filter-types))
-       (or (null gh-notifications--filter-repos)
-           (member (gh-notifications-notification-repo-full-name n)
-                   gh-notifications--filter-repos))
-       (gh-notifications--passes-ci-filter-p n)
-       (gh-notifications--passes-automation-and-ci-filter-p n)
-       (gh-notifications--passes-renovate-filter-p n)
-       (gh-notifications--passes-user-filter-p n)))
+  "Return non-nil when notification N satisfies every active filter.
+The outbox view lists every queued action and ignores the inbox filters."
+  (or
+   (eq gh-notifications--view 'outbox)
+   (and
+    (not (gh-notifications--pending-removal-p
+          (gh-notifications-notification-id n)))
+    (or (not gh-notifications--filter-unread-only)
+        (gh-notifications-notification-unread n))
+    (or (string-empty-p gh-notifications--filter-text)
+        (gh-notifications--text-match-p n gh-notifications--filter-text))
+    (or (null gh-notifications--filter-types)
+        (member (gh-notifications-notification-subject-type n)
+                gh-notifications--filter-types))
+    (or (null gh-notifications--filter-repos)
+        (member (gh-notifications-notification-repo-full-name n)
+                gh-notifications--filter-repos))
+    (gh-notifications--passes-ci-filter-p n)
+    (gh-notifications--passes-automation-and-ci-filter-p n)
+    (gh-notifications--passes-user-filter-p n))))
 
 (defun gh-notifications--passes-ci-filter-p (n)
   "Return non-nil when N passes the active CI filters.
@@ -1041,14 +1054,27 @@ and hides all non-CheckSuite notifications."
                          (conclusion (plist-get aug :ci-conclusion)))
                     (member conclusion gh-notifications--filter-ci-conclusions)))))))
 
-(defun gh-notifications--automation-notification-p (n)
-  "Return non-nil when N matches any automation sweep rule.
-Only PullRequest notifications are considered automation notifications."
+(defun gh-notifications--renovate-notification-p (n)
+  "Return non-nil when N is a PullRequest authored by Renovate.
+Authorship comes from the augmented author login and is matched against
+`gh-notifications-renovate-logins'.  Returns nil until N is augmented."
   (and (string= (gh-notifications-notification-subject-type n) "PullRequest")
-       (seq-some (lambda (rule)
-                   (and (gh-notifications--sweep-rule-repo-match-p rule n)
-                        (gh-notifications--sweep-rule-title-match-p rule n)))
-                 gh-notifications-sweep-rules)))
+       (when-let* ((author (plist-get
+                            (gethash (gh-notifications-notification-id n)
+                                     gh-notifications--augmentations)
+                            :author)))
+         (and (member author gh-notifications-renovate-logins) t))))
+
+(defun gh-notifications--automation-notification-p (n)
+  "Return non-nil when N is an automation PullRequest.
+A PullRequest is automation when it matches a sweep rule in
+`gh-notifications-sweep-rules' or is authored by Renovate."
+  (and (string= (gh-notifications-notification-subject-type n) "PullRequest")
+       (or (seq-some (lambda (rule)
+                       (and (gh-notifications--sweep-rule-repo-match-p rule n)
+                            (gh-notifications--sweep-rule-title-match-p rule n)))
+                     gh-notifications-sweep-rules)
+           (gh-notifications--renovate-notification-p n))))
 
 (defun gh-notifications--passes-automation-and-ci-filter-p (n)
   "Return non-nil when N passes the automation-and-CI hide filter."
@@ -1189,12 +1215,16 @@ by updated-at descending (most recent first)."
 (defconst gh-notifications--mine-buffer-name "*GitHub Notifications: My PRs*"
   "Name of the authored pull requests list buffer.")
 
+(defconst gh-notifications--outbox-buffer-name "*GitHub Notifications: Outbox*"
+  "Name of the pending to-be-sent actions list buffer.")
+
 (defun gh-notifications--buffer-name-for (view)
-  "Return the buffer name that holds VIEW (`inbox', `saved', or `mine')."
+  "Return the buffer name that holds VIEW (`inbox', `saved', `mine', `outbox')."
   (pcase view
-    ('saved gh-notifications--saved-buffer-name)
-    ('mine  gh-notifications--mine-buffer-name)
-    (_      gh-notifications--buffer-name)))
+    ('saved  gh-notifications--saved-buffer-name)
+    ('mine   gh-notifications--mine-buffer-name)
+    ('outbox gh-notifications--outbox-buffer-name)
+    (_       gh-notifications--buffer-name)))
 
 (defun gh-notifications--buffer (&optional view)
   "Return the notifications buffer for VIEW, creating it if necessary.
@@ -1213,9 +1243,10 @@ VIEW defaults to `inbox'."
 (defun gh-notifications--current-alist ()
   "Return the notifications alist for the current view."
   (pcase gh-notifications--view
-    ('saved gh-notifications--saved)
-    ('mine  gh-notifications--mine)
-    (_      gh-notifications--notifications)))
+    ('saved  gh-notifications--saved)
+    ('mine   gh-notifications--mine)
+    ('outbox (gh-notifications--pending-alist))
+    (_       gh-notifications--notifications)))
 
 ;;; Saved-for-later persistence
 
@@ -1245,10 +1276,151 @@ VIEW defaults to `inbox'."
           (print-circle nil))
       (prin1 gh-notifications--saved (current-buffer)))))
 
+;;; Pending action store (deferred GitHub sync)
+
+(defun gh-notifications--db ()
+  "Return the open pending-action database, creating its schema on first use."
+  (unless (and gh-notifications--db (sqlitep gh-notifications--db))
+    (let ((dir (file-name-directory gh-notifications-db-file)))
+      (when (and dir (not (file-directory-p dir)))
+        (make-directory dir t)))
+    (setq gh-notifications--db (sqlite-open gh-notifications-db-file))
+    (sqlite-execute
+     gh-notifications--db
+     "CREATE TABLE IF NOT EXISTS pending (id TEXT PRIMARY KEY, action TEXT NOT NULL, notification TEXT NOT NULL, queued_at REAL NOT NULL)"))
+  gh-notifications--db)
+
+(defun gh-notifications--pending-ensure-loaded ()
+  "Load `gh-notifications--pending' from the database on first use."
+  (unless gh-notifications--pending-loaded
+    (setq gh-notifications--pending-loaded t)
+    (clrhash gh-notifications--pending)
+    (condition-case err
+        (dolist (row (sqlite-select
+                      (gh-notifications--db)
+                      "SELECT id, action, notification, queued_at FROM pending"))
+          (pcase-let ((`(,id ,action ,notif ,queued) row))
+            (puthash id
+                     (list :action       (intern action)
+                           :notification (car (read-from-string notif))
+                           :queued-at    queued)
+                     gh-notifications--pending)))
+      (error
+       (message "gh-notifications: failed to load %s: %s"
+                gh-notifications-db-file err)))))
+
+(defun gh-notifications--pending-put (n action)
+  "Queue ACTION (a symbol) for notification N, persisting to the database.
+Re-queuing the same thread replaces its action."
+  (gh-notifications--pending-ensure-loaded)
+  (let* ((id      (gh-notifications-notification-id n))
+         (now     (float-time))
+         (printed (let ((print-length nil)
+                        (print-level  nil)
+                        (print-circle nil))
+                    (prin1-to-string n))))
+    (puthash id (list :action action :notification n :queued-at now)
+             gh-notifications--pending)
+    (condition-case err
+        (sqlite-execute
+         (gh-notifications--db)
+         "INSERT INTO pending (id, action, notification, queued_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET action = excluded.action, notification = excluded.notification, queued_at = excluded.queued_at"
+         (list id (symbol-name action) printed now))
+      (error
+       (message "gh-notifications: failed to persist pending %s: %s" id err)))))
+
+(defun gh-notifications--pending-remove (id)
+  "Remove ID from the pending store and the database."
+  (gh-notifications--pending-ensure-loaded)
+  (remhash id gh-notifications--pending)
+  (condition-case err
+      (sqlite-execute (gh-notifications--db)
+                      "DELETE FROM pending WHERE id = ?" (list id))
+    (error
+     (message "gh-notifications: failed to delete pending %s: %s" id err))))
+
+(defun gh-notifications--pending-action (id)
+  "Return the pending action symbol queued for ID, or nil."
+  (gh-notifications--pending-ensure-loaded)
+  (plist-get (gethash id gh-notifications--pending) :action))
+
+(defun gh-notifications--pending-removal-p (id)
+  "Return non-nil when ID has a pending action that hides it from the inbox."
+  (memq (gh-notifications--pending-action id) '(done unsubscribe close-pr)))
+
+(defun gh-notifications--pending-alist ()
+  "Return the pending store as an alist of thread-id to notification struct."
+  (gh-notifications--pending-ensure-loaded)
+  (let (alist)
+    (maphash (lambda (id plist)
+               (push (cons id (plist-get plist :notification)) alist))
+             gh-notifications--pending)
+    alist))
+
+(defun gh-notifications--pending-count ()
+  "Return the number of queued pending actions."
+  (gh-notifications--pending-ensure-loaded)
+  (hash-table-count gh-notifications--pending))
+
+(defun gh-notifications--queue-notifs (notifs action label)
+  "Queue ACTION for each struct in NOTIFS, record an undo batch, and re-render.
+LABEL names the action in the status message."
+  (when notifs
+    (gh-notifications--push-action label notifs 'inbox)
+    (dolist (n notifs)
+      (gh-notifications--pending-put n action))
+    (gh-notifications--render)
+    (message "gh-notifications: queued %d to %s (g to sync, Z to undo)"
+             (length notifs) label)))
+
+(defun gh-notifications--api-for-action (action)
+  "Return the GitHub API function implementing pending ACTION, or nil."
+  (pcase action
+    ('done        #'gh-notifications--api-mark-done)
+    ('read        #'gh-notifications--api-mark-read)
+    ('unsubscribe #'gh-notifications--api-unsubscribe)
+    ('close-pr    #'gh-notifications--api-close-pr-and-delete-branch)
+    (_            nil)))
+
+(defun gh-notifications--flush-pending (callback)
+  "Send every pending action to GitHub, then call CALLBACK with no arguments.
+At most `gh-notifications-augment-concurrency' requests run simultaneously.
+Each action is removed from the store once its request completes."
+  (gh-notifications--pending-ensure-loaded)
+  (let (queue)
+    (maphash (lambda (id plist)
+               (push (cons id (plist-get plist :action)) queue))
+             gh-notifications--pending)
+    (if (null queue)
+        (funcall callback)
+      (let* ((total    (length queue))
+             (done     0)
+             (inflight 0))
+        (message "gh-notifications: syncing %d pending action(s)..." total)
+        (cl-labels
+            ((settle (id)
+               (gh-notifications--pending-remove id)
+               (cl-decf inflight)
+               (cl-incf done)
+               (fire-next)
+               (when (= done total)
+                 (message "gh-notifications: synced %d pending action(s)" total)
+                 (funcall callback)))
+             (fire-next ()
+               (while (and queue
+                           (< inflight gh-notifications-augment-concurrency))
+                 (pcase-let* ((`(,id . ,action) (pop queue))
+                              (fn (gh-notifications--api-for-action action)))
+                   (cl-incf inflight)
+                   (if fn
+                       (funcall fn id (lambda () (settle id)))
+                     (settle id))))))
+          (fire-next))))))
+
 (defun gh-notifications--render ()
   "Redraw every live gh-notifications buffer.
 Each buffer holds its own view via the buffer-local `gh-notifications--view'."
-  (dolist (view '(inbox saved mine))
+  (dolist (view '(inbox saved mine outbox))
     (when-let* ((buf (get-buffer (gh-notifications--buffer-name-for view))))
       (with-current-buffer buf
         (gh-notifications--render-current-buffer)))))
@@ -1263,9 +1435,10 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
       (let ((groups (gh-notifications--grouped-notifications)))
         (if (null groups)
             (insert (propertize (pcase gh-notifications--view
-                                  ('saved "  Nothing saved for later.\n")
-                                  ('mine  "  No authored pull requests match the current filters.\n")
-                                  (_      "  No notifications match the current filters.\n"))
+                                  ('saved  "  Nothing saved for later.\n")
+                                  ('mine   "  No authored pull requests match the current filters.\n")
+                                  ('outbox "  No pending actions to sync.\n")
+                                  (_       "  No notifications match the current filters.\n"))
                                 'font-lock-face 'shadow))
           (dolist (group groups)
             (gh-notifications--insert-repo-section
@@ -1298,9 +1471,10 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
                           gh-notifications--filter-ci-conclusions
                           gh-notifications--filter-users)))
     (insert (propertize (pcase gh-notifications--view
-                          ('saved "GitHub Notifications — Saved for later")
-                          ('mine  "GitHub Notifications — My pull requests")
-                          (_      "GitHub Notifications"))
+                          ('saved  "GitHub Notifications — Saved for later")
+                          ('mine   "GitHub Notifications — My pull requests")
+                          ('outbox "GitHub Notifications — Outbox (to sync)")
+                          (_       "GitHub Notifications"))
                         'font-lock-face 'magit-section-heading))
     (insert "  ")
     (insert (propertize (format "%d unread" unread) 'font-lock-face 'gh-notifications-unread))
@@ -1316,6 +1490,11 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
       (insert "  ")
       (insert (propertize (format "%d kept" kept)
                           'font-lock-face 'gh-notifications-keep)))
+    (let ((pending (gh-notifications--pending-count)))
+      (when (and (> pending 0) (not (eq gh-notifications--view 'outbox)))
+        (insert "  ")
+        (insert (propertize (format "%d queued (W, g to sync)" pending)
+                            'font-lock-face 'gh-notifications-marked))))
     (insert "\n")
     (when filtering-p
       (insert (propertize "Filters:" 'font-lock-face 'magit-section-secondary-heading))
@@ -1366,8 +1545,10 @@ Each buffer holds its own view via the buffer-local `gh-notifications--view'."
   "Insert a single propertized line for notification N.
 The notification struct is stored as the `gh-notification' text property
 on the line so that `gh-notifications--notification-at-point' can retrieve it."
-  (let* ((id     (gh-notifications-notification-id n))
-         (unread (gh-notifications-notification-unread n))
+  (let* ((id       (gh-notifications-notification-id n))
+         (pending  (gh-notifications--pending-action id))
+         (unread (and (gh-notifications-notification-unread n)
+                      (not (eq pending 'read))))
          (marked (member id gh-notifications--marked))
          (kept   (member id gh-notifications--kept-ids))
          (old    (gh-notifications--old-p n))
@@ -1384,6 +1565,15 @@ on the line so that `gh-notifications--notification-at-point' can retrieve it."
              (marked (propertize "● " 'font-lock-face 'gh-notifications-marked))
              (kept   (propertize "★ " 'font-lock-face 'gh-notifications-keep))
              (t      "  ")))
+    (when pending
+      (insert (propertize (format "%-5s "
+                                  (pcase pending
+                                    ('done        "done")
+                                    ('read        "read")
+                                    ('unsubscribe "unsub")
+                                    ('close-pr    "close")
+                                    (_            "?")))
+                          'font-lock-face 'gh-notifications-marked)))
     (insert (gh-notifications--type-indicator type))
     (insert " ")
     (insert (propertize (truncate-string-to-width title gh-notifications--title-width
@@ -1431,10 +1621,11 @@ The ring is capped at `gh-notifications-action-ring-size'."
                     gh-notifications-action-ring-size))))
 
 (defun gh-notifications-undo ()
-  "Restore all notifications from the most recent action as a single undo step.
-This reverses the local view state only; the GitHub API change is not undone.
-Each press of `Z' undoes one batch, regardless of how many notifications it
-contained."
+  "Undo the most recent action as a single step.
+For queued inbox actions this cancels the pending sync so the notifications
+reappear.  Because the GitHub change was deferred, nothing needs to be
+reversed remotely.  For the saved view this restores the removed entries.
+Each press of `Z' undoes one batch, regardless of its size."
   (interactive)
   (if (null gh-notifications--action-ring)
       (user-error "gh-notifications: nothing to undo")
@@ -1453,77 +1644,69 @@ contained."
         (_
          (dolist (n notifs)
            (let ((id (gh-notifications-notification-id n)))
+             (gh-notifications--pending-remove id)
              (unless (alist-get id gh-notifications--notifications nil nil #'equal)
                (push (cons id n) gh-notifications--notifications))))))
       (gh-notifications--render)
-      (message "gh-notifications: restored %d notification(s) (undo of %s in %s%s)"
-               count action view
-               (if (eq view 'saved) "" " — GitHub state unchanged")))))
+      (message "gh-notifications: undid %s for %d notification(s)"
+               action count))))
 
 (defun gh-notifications-refresh ()
-  "Refresh the notifications list from GitHub.
-On a manual refresh, augmentation is invalidated for all currently visible
-PR and Issue notifications so their state is re-fetched unconditionally.
-The poll timer does not do this; it relies on updated-at changes instead."
+  "Flush queued actions to GitHub, then refresh the notifications list.
+Pending actions queued in the inbox (done, read, unsubscribe, close-pr) are
+sent first, then the list is re-fetched.  Augmentation is invalidated for all
+currently visible PR and Issue notifications so their state is re-fetched
+unconditionally."
   (interactive)
-  (message "gh-notifications: fetching...")
+  (message "gh-notifications: syncing...")
   (dolist (pair (gh-notifications--filtered-notifications))
     (let* ((n  (cdr pair))
            (id (gh-notifications-notification-id n)))
       (gh-notifications--invalidate-augmentation id n)))
-  (if (eq gh-notifications--view 'mine)
-      (gh-notifications--fetch-my-prs
-       (lambda ()
-         (gh-notifications--render)
-         (message "gh-notifications: done")))
-    (gh-notifications--fetch
-     (lambda ()
-       (gh-notifications--render)
-       (message "gh-notifications: done")))))
+  (gh-notifications--flush-pending
+   (lambda ()
+     (if (eq gh-notifications--view 'mine)
+         (gh-notifications--fetch-my-prs
+          (lambda ()
+            (gh-notifications--render)
+            (message "gh-notifications: done")))
+       (gh-notifications--fetch
+        (lambda ()
+          (gh-notifications--render)
+          (message "gh-notifications: done")))))))
 
 (defun gh-notifications-mark-done ()
   "Mark the notification at point as done.
-In the inbox view this deletes the thread on GitHub.
+In the inbox view this queues the thread for deletion on the next refresh.
+In the outbox view this cancels the queued action for the thread.
 In the saved view this removes the notification from the persisted store."
   (interactive)
   (cond
    ((eq gh-notifications--view 'saved)
     (gh-notifications-saved-remove-at-point))
+   ((eq gh-notifications--view 'outbox)
+    (gh-notifications-outbox-cancel-at-point))
    ((eq gh-notifications--view 'mine)
     (user-error "Mark done is unavailable in My PRs view"))
    (t
     (when-let* ((n (gh-notifications--notification-at-point)))
-      (gh-notifications--push-action "mark-done" (list n) 'inbox)
-      (gh-notifications--api-mark-done
-       (gh-notifications-notification-id n)
-       (lambda ()
-         (gh-notifications--render)
-         (message "gh-notifications: marked done (Z to undo locally)")))))))
+      (gh-notifications--queue-notifs (list n) 'done "done")))))
 
 (defun gh-notifications-mark-read ()
-  "Mark the notification at point as read."
+  "Queue the notification at point to be marked read on the next refresh."
   (interactive)
-  (when (eq gh-notifications--view 'mine)
-    (user-error "Mark read is unavailable in My PRs view"))
+  (when (memq gh-notifications--view '(mine outbox))
+    (user-error "Mark read is unavailable in this view"))
   (when-let* ((n (gh-notifications--notification-at-point)))
-    (gh-notifications--api-mark-read
-     (gh-notifications-notification-id n)
-     (lambda ()
-       (gh-notifications--render)
-       (message "gh-notifications: marked read")))))
+    (gh-notifications--queue-notifs (list n) 'read "read")))
 
 (defun gh-notifications-unsubscribe ()
-  "Unsubscribe from and mark done the notification at point."
+  "Queue the notification at point to be unsubscribed on the next refresh."
   (interactive)
-  (when (eq gh-notifications--view 'mine)
-    (user-error "Unsubscribe is unavailable in My PRs view"))
+  (when (memq gh-notifications--view '(mine outbox))
+    (user-error "Unsubscribe is unavailable in this view"))
   (when-let* ((n (gh-notifications--notification-at-point)))
-    (gh-notifications--push-action "unsubscribe" (list n))
-    (gh-notifications--api-unsubscribe
-     (gh-notifications-notification-id n)
-     (lambda ()
-       (gh-notifications--render)
-       (message "gh-notifications: unsubscribed (Z to undo locally)")))))
+    (gh-notifications--queue-notifs (list n) 'unsubscribe "unsubscribe")))
 
 (defun gh-notifications-open ()
   "Open the notification at point in a browser and mark it read.
@@ -1556,14 +1739,16 @@ fails."
         (gh-notifications--open-notification n)))))
 
 (defun gh-notifications--open-notification (n)
-  "Open notification N in a browser and mark it read."
+  "Open notification N in a browser and queue it to be marked read.
+The read status is synced to GitHub on the next refresh."
   (let ((url (gh-notifications--subject-html-url n)))
     (when url
       (browse-url url)
-      (when (gh-notifications-notification-unread n)
-        (gh-notifications--api-mark-read
-         (gh-notifications-notification-id n)
-         #'gh-notifications--render)))))
+      (when (and (gh-notifications-notification-unread n)
+                 (not (gh-notifications--pending-action
+                       (gh-notifications-notification-id n))))
+        (gh-notifications--pending-put n 'read)
+        (gh-notifications--render)))))
 
 (defun gh-notifications--resolve-ci-run-and-open (n)
   "Resolve the matching Actions run URL for CheckSuite N, cache it, then open.
@@ -1692,20 +1877,17 @@ Kept notifications survive reconciliation pruning even when missing remotely."
 
 (defun gh-notifications-section-or-region-done ()
   "Mark all notifications in the active region or repo section at point as done.
-In the inbox view this deletes the threads on GitHub with bounded concurrency.
+In the inbox view this queues the threads for deletion on the next refresh.
 In the saved view this removes the notifications from the persisted store.
 Pushes the batch as a single action-ring entry so Z restores all at once."
   (interactive)
-  (when (eq gh-notifications--view 'mine)
-    (user-error "Mark done is unavailable in My PRs view"))
-  (let* ((notifs   (if (use-region-p)
-                       (gh-notifications--notifications-in-region
-                        (region-beginning) (region-end))
-                     (gh-notifications--notifications-in-section)))
-         (count    (length notifs))
-         (done     0)
-         (inflight 0)
-         (queue    (copy-sequence notifs)))
+  (when (memq gh-notifications--view '(mine outbox))
+    (user-error "Mark done is unavailable in this view"))
+  (let* ((notifs (if (use-region-p)
+                     (gh-notifications--notifications-in-region
+                      (region-beginning) (region-end))
+                   (gh-notifications--notifications-in-section)))
+         (count  (length notifs)))
     (deactivate-mark)
     (cond
      ((null notifs)
@@ -1714,24 +1896,7 @@ Pushes the batch as a single action-ring entry so Z restores all at once."
       (gh-notifications--saved-remove notifs)
       (message "gh-notifications: removed %d from saved (Z to undo)" count))
      (t
-      (gh-notifications--push-action "mark-done" notifs 'inbox)
-      (cl-labels
-          ((fire-next ()
-             (while (and queue
-                         (< inflight gh-notifications-augment-concurrency))
-               (let ((n (pop queue)))
-                 (cl-incf inflight)
-                 (gh-notifications--api-mark-done
-                  (gh-notifications-notification-id n)
-                  (lambda ()
-                    (cl-decf inflight)
-                    (cl-incf done)
-                    (fire-next)
-                    (when (= done count)
-                      (gh-notifications--render)
-                      (message "gh-notifications: marked %d done (Z to undo locally)"
-                               count))))))))
-        (fire-next))))))
+      (gh-notifications--queue-notifs notifs 'done "done")))))
 
 (defun gh-notifications-execute-marked ()
   "Open the batch dispatch transient for the currently marked notifications."
@@ -1743,39 +1908,15 @@ Pushes the batch as a single action-ring entry so Z restores all at once."
 ;;; Batch commands
 
 (defun gh-notifications--batch-do (action label)
-  "Apply ACTION to each marked notification ID with limited concurrency.
-At most `gh-notifications-augment-concurrency' requests run simultaneously,
-preventing the url connection pool from being overwhelmed.
-LABEL is used in the completion message.
-The entire batch is pushed as a single action-ring entry."
-  (let* ((ids      (copy-sequence gh-notifications--marked))
-         (total    (length ids))
-         (done     0)
-         (inflight 0)
-         (queue    (copy-sequence ids))
-         (notifs   (delq nil (mapcar (lambda (id)
-                                       (alist-get id gh-notifications--notifications
-                                                  nil nil #'equal))
-                                     ids))))
-    (when notifs
-      (gh-notifications--push-action label notifs))
-    (cl-labels
-        ((fire-next ()
-           (while (and queue
-                       (< inflight gh-notifications-augment-concurrency))
-             (let ((id (pop queue)))
-               (cl-incf inflight)
-               (funcall action id
-                        (lambda ()
-                          (cl-decf inflight)
-                          (cl-incf done)
-                          (fire-next)
-                          (when (= done total)
-                            (setq gh-notifications--marked nil)
-                            (gh-notifications--render)
-                            (message "gh-notifications: %s %d notification(s) (Z to undo locally)"
-                                     label total))))))))
-      (fire-next))))
+  "Queue ACTION (a symbol) for every marked notification as a deferred sync.
+LABEL names the action in the status message.  The whole batch is recorded as
+a single action-ring entry and the marks are cleared."
+  (let ((notifs (delq nil (mapcar (lambda (id)
+                                    (alist-get id gh-notifications--notifications
+                                               nil nil #'equal))
+                                  gh-notifications--marked))))
+    (setq gh-notifications--marked nil)
+    (gh-notifications--queue-notifs notifs action label)))
 
 (defun gh-notifications-batch-mark-done ()
   "Mark all marked notifications as done.
@@ -1798,7 +1939,7 @@ store instead of calling the GitHub API."
       (message "gh-notifications: removed %d from saved (Z to undo)"
                (length notifs))))
    (t
-    (gh-notifications--batch-do #'gh-notifications--api-mark-done "marked done"))))
+    (gh-notifications--batch-do 'done "done"))))
 
 (defun gh-notifications-batch-mark-read ()
   "Mark all marked notifications as read."
@@ -1809,7 +1950,7 @@ store instead of calling the GitHub API."
    ((eq gh-notifications--view 'mine)
     (user-error "Mark read is unavailable in My PRs view"))
    (t
-    (gh-notifications--batch-do #'gh-notifications--api-mark-read "marked read"))))
+    (gh-notifications--batch-do 'read "read"))))
 
 (defun gh-notifications-batch-unsubscribe ()
   "Unsubscribe from all marked notifications."
@@ -1820,8 +1961,7 @@ store instead of calling the GitHub API."
    ((eq gh-notifications--view 'mine)
     (user-error "Unsubscribe is unavailable in My PRs view"))
    (t
-    (gh-notifications--batch-do
-     #'gh-notifications--api-unsubscribe "unsubscribed from"))))
+    (gh-notifications--batch-do 'unsubscribe "unsubscribe"))))
 
 ;;; Saved for later
 
@@ -1879,6 +2019,22 @@ This view is backed by GitHub Search API results instead of notifications."
     (if gh-notifications--mine
         (gh-notifications--render)
       (gh-notifications-refresh))))
+
+(defun gh-notifications-show-outbox ()
+  "Open the outbox view listing actions queued to sync on the next refresh."
+  (interactive)
+  (gh-notifications--pending-ensure-loaded)
+  (let ((buf (gh-notifications--buffer 'outbox)))
+    (pop-to-buffer buf)
+    (gh-notifications--render)))
+
+(defun gh-notifications-outbox-cancel-at-point ()
+  "Cancel the queued action for the notification at point in the outbox view."
+  (interactive)
+  (when-let* ((n (gh-notifications--notification-at-point)))
+    (gh-notifications--pending-remove (gh-notifications-notification-id n))
+    (gh-notifications--render)
+    (message "gh-notifications: cancelled queued action")))
 
 ;;; Filter commands
 
@@ -1992,9 +2148,10 @@ Selecting nothing clears the CI conclusion filter."
   (gh-notifications--render))
 
 (defun gh-notifications-sweep-ci-success ()
-  "Mark done all visible CI notifications with a non-failure conclusion.
+  "Queue done for all visible CI notifications with a non-failure conclusion.
 Covers: success, skipped, neutral, cancelled.
-Prompts for confirmation before making any API calls."
+The action is queued and synced to GitHub on the next refresh.
+Prompts for confirmation before queuing."
   (interactive)
   (let* ((sweepable '("success" "skipped" "neutral" "cancelled"))
          (targets
@@ -2016,7 +2173,7 @@ Prompts for confirmation before making any API calls."
               (mapcar (lambda (p)
                         (gh-notifications-notification-id (cdr p)))
                       targets))
-        (gh-notifications--batch-do #'gh-notifications--api-mark-done "swept")))))
+        (gh-notifications--batch-do 'done "done (swept)")))))
 
 ;;; Rule-based automated PR sweeps
 
@@ -2113,7 +2270,8 @@ Interactively re-uses the last rule applied via
 `gh-notifications-filter-sweep-rule' in this buffer.  Pass a prefix argument
 to choose a different rule.
 Only augmented notifications are eligible; run after augmentation completes.
-Prompts for confirmation before making any API calls."
+The action is queued and synced to GitHub on the next refresh.
+Prompts for confirmation before queuing."
   (interactive
    (list (if (and (not current-prefix-arg)
                   gh-notifications--active-sweep-rule
@@ -2172,20 +2330,21 @@ Prompts for confirmation before making any API calls."
               (mapcar (lambda (p)
                         (gh-notifications-notification-id (cdr p)))
                       targets))
-        (gh-notifications--batch-do #'gh-notifications--api-mark-done "swept"))))))
+        (gh-notifications--batch-do 'done "done (swept)"))))))
 
 (defun gh-notifications-sweep-close-open-rule (rule)
   "Close and clean up visible open PRs matching sweep RULE.
 A notification is targeted when it is a PullRequest whose repo full name ends
 with RULE's :repo suffix, whose title starts with one of RULE's :prefixes,
 and whose augmentation :pr-state is open or draft.
-The command closes each PR, deletes the PR head branch, then marks the
-notification done.
+Each targeted PR is queued for a close, head-branch delete, and mark-done
+that run on the next refresh.
 Interactively re-uses the last rule applied via
 `gh-notifications-filter-sweep-rule' in this buffer.  Pass a prefix argument
 to choose a different rule.
 Only augmented notifications are eligible; run after augmentation completes.
-Prompts for confirmation before making any API calls."
+The action is queued and synced to GitHub on the next refresh.
+Prompts for confirmation before queuing."
   (interactive
    (list (if (and (not current-prefix-arg)
                   gh-notifications--active-sweep-rule
@@ -2244,9 +2403,7 @@ Prompts for confirmation before making any API calls."
               (mapcar (lambda (p)
                         (gh-notifications-notification-id (cdr p)))
                       targets))
-        (gh-notifications--batch-do
-         #'gh-notifications--api-close-pr-and-delete-branch
-         "closed and cleaned up"))))))
+        (gh-notifications--batch-do 'close-pr "close PR and prune"))))))
 
 (defun gh-notifications-filter-deployment-tools-cicd ()
   "Deprecated.  Applies the `deployment-tools cicd' sweep rule.
@@ -2528,47 +2685,6 @@ Renders nothing when ITEMS is nil or empty."
 
 ;;; Polling
 
-(defun gh-notifications--start-poll-timer ()
-  "Start the background polling timer, cancelling any existing one first."
-  (gh-notifications--stop-poll-timer)
-  (when (and gh-notifications-poll-interval
-             (not gh-notifications--poll-paused))
-    (setq gh-notifications--poll-timer
-          (run-at-time gh-notifications-poll-interval
-                       gh-notifications-poll-interval
-                       #'gh-notifications--poll-tick))))
-
-(defun gh-notifications--stop-poll-timer ()
-  "Cancel the background polling timer if one is running."
-  (when (timerp gh-notifications--poll-timer)
-    (cancel-timer gh-notifications--poll-timer)
-    (setq gh-notifications--poll-timer nil)))
-
-(defun gh-notifications--poll-tick ()
-  "Fetch notifications and re-render if the buffer is still live.
-Background poll errors are logged silently to avoid interrupting the user."
-  (when (and (not gh-notifications--poll-paused)
-             (buffer-live-p (get-buffer gh-notifications--buffer-name)))
-    (gh-notifications--fetch
-     (lambda ()
-       (when (buffer-live-p (get-buffer gh-notifications--buffer-name))
-         (gh-notifications--render)))
-     t)))
-
-(defun gh-notifications-toggle-auto-refresh ()
-  "Pause or resume automatic background polling."
-  (interactive)
-  (setq gh-notifications--poll-paused (not gh-notifications--poll-paused))
-  (if gh-notifications--poll-paused
-      (progn
-        (gh-notifications--stop-poll-timer)
-        (message "gh-notifications: auto-refresh paused"))
-    (gh-notifications--start-poll-timer)
-    (if gh-notifications-poll-interval
-        (message "gh-notifications: auto-refresh resumed (%ss)"
-                 gh-notifications-poll-interval)
-      (message "gh-notifications: auto-refresh is disabled (poll interval is nil)"))))
-
 ;;; Per-pinned-user commands
 
 (defun gh-notifications-filter-user-robbymilo ()
@@ -2594,13 +2710,18 @@ Background poll errors are logged silently to avoid interrupting the user."
     (princ "Entry points\n")
     (princ "  ? or h   Open transient command menu\n")
     (princ "  H        Open this shortcuts guide\n")
-    (princ "  O        Open My PRs view\n\n")
+    (princ "  O        Open My PRs view\n")
+    (princ "  W        Open outbox (actions queued to sync)\n\n")
+    (princ "Deferred sync model\n")
+    (princ "  Actions below are queued locally for immediate feedback and\n")
+    (princ "  sent to GitHub on the next refresh (g).\n\n")
     (princ "Common actions\n")
-    (princ "  RET or o Open notification\n")
-    (princ "  d        Mark done\n")
+    (princ "  RET or o Open notification (queues read)\n")
+    (princ "  d        Queue done (outbox: cancel queued action)\n")
     (princ "  k        Toggle local keep\n")
-    (princ "  r        Mark read\n")
-    (princ "  u        Unsubscribe\n")
+    (princ "  r        Queue read\n")
+    (princ "  u        Queue unsubscribe\n")
+    (princ "  g        Sync queued actions and refresh\n")
     (princ "  m/M/U/x  Mark workflow\n\n")
     (princ "Filters\n")
     (princ "  / t / u / r / T / a / c  Text, unread, repo, type, human-only, clear\n")
@@ -2626,6 +2747,7 @@ Background poll errors are logged silently to avoid interrupting the user."
     ("s"   "Save for later"    gh-notifications-save-for-later)
     ("L"   "View saved"        gh-notifications-show-saved)
     ("O"   "View my pull requests" gh-notifications-show-my-prs)
+    ("W"   "View outbox (to sync)" gh-notifications-show-outbox)
     ("Z"   "Undo last action"  gh-notifications-undo)]
    [("m"   "Toggle mark"       gh-notifications-toggle-mark)
     ("M"   "Mark all visible"  gh-notifications-mark-all)
@@ -2658,8 +2780,7 @@ Background poll errors are logged silently to avoid interrupting the user."
     ("n"   "Next notification"     gh-notifications-next-notification)
     ("p"   "Previous notification" gh-notifications-previous-notification)
     ("j"   "Jump to repo"          gh-notifications-jump-to-repo)
-    ("g"   "Refresh"               gh-notifications-refresh)
-    ("P"   "Pause/resume auto-refresh" gh-notifications-toggle-auto-refresh)
+    ("g"   "Sync queued actions and refresh" gh-notifications-refresh)
     ("q"   "Quit"                  quit-window)]])
 
 (transient-define-prefix gh-notifications-batch-dispatch ()
@@ -2686,7 +2807,6 @@ Background poll errors are logged silently to avoid interrupting the user."
 (define-key gh-notifications-mode-map (kbd "p")   #'gh-notifications-previous-notification)
 (define-key gh-notifications-mode-map (kbd "j")   #'gh-notifications-jump-to-repo)
 (define-key gh-notifications-mode-map (kbd "g")   #'gh-notifications-refresh)
-(define-key gh-notifications-mode-map (kbd "P")   #'gh-notifications-toggle-auto-refresh)
 (define-key gh-notifications-mode-map (kbd "RET") #'gh-notifications-show)
 (define-key gh-notifications-mode-map (kbd "i")   #'gh-notifications-show)
 (define-key gh-notifications-mode-map (kbd "o")   #'gh-notifications-open)
@@ -2694,6 +2814,7 @@ Background poll errors are logged silently to avoid interrupting the user."
 (define-key gh-notifications-mode-map (kbd "s")   #'gh-notifications-save-for-later)
 (define-key gh-notifications-mode-map (kbd "L")   #'gh-notifications-show-saved)
 (define-key gh-notifications-mode-map (kbd "O")   #'gh-notifications-show-my-prs)
+(define-key gh-notifications-mode-map (kbd "W")   #'gh-notifications-show-outbox)
 (define-key gh-notifications-mode-map (kbd "D")   #'gh-notifications-section-or-region-done)
 (define-key gh-notifications-mode-map (kbd "r")   #'gh-notifications-mark-read)
 (define-key gh-notifications-mode-map (kbd "u")   #'gh-notifications-unsubscribe)
@@ -2731,8 +2852,7 @@ Background poll errors are logged silently to avoid interrupting the user."
   (setq-local buffer-read-only t)
   (setq-local revert-buffer-function
               (lambda (_ignore-auto _noconfirm)
-                (gh-notifications-refresh)))
-  (add-hook 'kill-buffer-hook #'gh-notifications--stop-poll-timer nil t))
+                (gh-notifications-refresh))))
 
 ;;; Entry point
 
@@ -2742,7 +2862,7 @@ Background poll errors are logged silently to avoid interrupting the user."
   (interactive)
   (let ((buf (gh-notifications--buffer)))
     (pop-to-buffer buf)
-    (gh-notifications--start-poll-timer)
+    (gh-notifications--pending-ensure-loaded)
     (if gh-notifications--notifications
         (gh-notifications--render)
       (gh-notifications-refresh))))
