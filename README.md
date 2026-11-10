@@ -28,6 +28,9 @@ If you are not already authenticated, run:
 gh auth login
 ```
 
+Expiring OAuth tokens are supported.
+gh refreshes an expiring token each time `gh auth token` runs, so the package re-reads the token every `gh-notifications-token-cache-ttl` seconds (default 300) rather than holding one copy for the whole session.
+
 To force a fresh token lookup after re-authenticating, call `M-x gh-notifications-clear-token-cache`.
 
 ## Usage
@@ -95,5 +98,6 @@ Repo sections can be folded and unfolded with `TAB`, following the standard `mag
 | `gh-notifications-my-prs-max-pages`    | `10`                                          | Max search pages for My PRs view (100 items per page)                                          |
 | `gh-notifications-auto-mark-done-days` | `nil`                                         | Auto-mark-done threshold in days; nil to disable                                               |
 | `gh-notifications-older-than-days`     | `7`                                           | Notifications older than this are dimmed                                                       |
+| `gh-notifications-token-cache-ttl`     | `300`                                         | Seconds a `gh auth token` result is reused before re-reading; keeps expiring tokens fresh      |
 
 All faces are in the `gh-notifications` customization group and can be adjusted with `M-x customize-group RET gh-notifications RET`.

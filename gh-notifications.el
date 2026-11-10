@@ -162,6 +162,16 @@ needed for user-based filtering."
   :type 'natnum
   :group 'gh-notifications)
 
+(defcustom gh-notifications-token-cache-ttl 300
+  "Seconds a token from `gh auth token' is reused before re-reading it.
+gh issues expiring OAuth access tokens and refreshes them on each
+invocation of `gh auth token', so a held token must not outlive its
+expiry.  A short TTL re-reads the token often enough that gh refreshes
+it ahead of expiry, while coalescing request bursts into one read.
+Must stay well below the access-token lifetime of 8 hours."
+  :type 'natnum
+  :group 'gh-notifications)
+
 ;;; Faces
 
 (defface gh-notifications-unread
@@ -405,22 +415,30 @@ stored immediately in `gh-notifications--augmentations'."
 ;;; Authentication
 
 (defvar gh-notifications--token-cache nil
-  "Cached token returned by `gh auth token', or nil when not yet resolved.")
+  "Cons of (TOKEN . FETCH-TIME) from `gh auth token', or nil when unresolved.
+FETCH-TIME is the `float-time' at which TOKEN was read.")
 
 (defvar gh-notifications--login-cache nil
   "Cached GitHub login from `GET /user', or nil when not yet resolved.")
 
 (defun gh-notifications--token ()
   "Return a GitHub API token by invoking `gh auth token'.
-The result is cached for the lifetime of the Emacs session.
+The token is cached for `gh-notifications-token-cache-ttl' seconds and
+then re-read.  gh refreshes expiring OAuth tokens on each invocation, so
+a short TTL keeps the held token valid without spawning gh per request.
 Signal a `user-error' when the gh CLI is unavailable or returns no token."
-  (or gh-notifications--token-cache
+  (let ((cached gh-notifications--token-cache))
+    (if (and cached
+             (< (- (float-time) (cdr cached))
+                gh-notifications-token-cache-ttl))
+        (car cached)
       (let ((raw (string-trim
                   (shell-command-to-string "gh auth token 2>/dev/null"))))
         (if (string-empty-p raw)
             (user-error
              "gh auth token returned nothing; run `gh auth login' first")
-          (setq gh-notifications--token-cache raw)))))
+          (setq gh-notifications--token-cache (cons raw (float-time)))
+          raw)))))
 
 (defun gh-notifications-clear-token-cache ()
   "Clear cached authentication identity and token.
